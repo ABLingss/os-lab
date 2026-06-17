@@ -1,0 +1,30 @@
+flowchart TD
+    A["schedule()\n调度器入口\nkernel/sched/core.c"] --> B["__schedule()\n核心调度决策\nkernel/sched/core.c"]
+    B --> C{"need_resched?\n需要重调度?"}
+    C -->|"否"| END["return\n直接返回"]
+    C -->|"是"| D["pick_next_task()\n选择下一进程"]
+    D --> E["__pick_next_task()\n按调度类优先级遍历"]
+    E --> F{"for_each_active_class\n逐个调度类查找"}
+    F --> G1["stop 停止类\nCPU热插拔/迁移"]
+    F --> G2["dl 限期类\nEDF+CBS算法"]
+    F --> G3["rt 实时类\nFIFO/RR调度"]
+    F --> G4["fair 公平类\nCFS/EEVDF\npick_next_entity()\n__pick_eevdf()"]
+    F --> G5["idle 空闲类\n每CPU空闲任务"]
+    G1 --> H["context_switch()\n上下文切换入口"]
+    G2 --> H
+    G3 --> H
+    G4 --> H
+    G5 --> H
+    H --> I["switch_mm_irqs_off()\n切换地址空间\n写入CR3寄存器\narch/x86/mm/tlb.c"]
+    H --> J["switch_to()\n切换执行现场\narch/x86/include/asm/switch_to.h"]
+    I --> K["load_new_mm_cr3()\n加载新页表基址"]
+    J --> L["__switch_to_asm()\n汇编级寄存器切换\narch/x86/entry/entry_64.S"]
+    L --> M["保存prev现场\n保存RSP→thread.sp\n加载next的RSP\n★ 执行流在此切换 ★\n恢复next现场\njmp __switch_to()"]
+    M --> N["__switch_to()\n架构状态收尾\n更新current_task\nswitch_fpu/xtra\narch/x86/kernel/process_64.c"]
+
+    style A fill:#1e40af,stroke:#1e3a8a,color:#fff
+    style B fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style D fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style H fill:#059669,stroke:#047857,color:#fff
+    style J fill:#dc2626,stroke:#b91c1c,color:#fff
+    style L fill:#dc2626,stroke:#b91c1c,color:#fff

@@ -1,0 +1,23 @@
+flowchart TD
+    A["缺页异常\narch/x86/mm/fault.c\nIDT exc_page_fault"] --> B["handle_page_fault()\n读取CR2 fault地址\n解析error_code"]
+    B --> C{"异常类型判断"}
+    C -->|"用户态越权"| D["do_sigsegv()\n→ SIGSEGV"]
+    C -->|"内核态非法"| E["Oops / Panic\n内核崩溃"]
+    C -->|"合法用户缺页"| F["handle_mm_fault()\nmm/memory.c\n五级页表遍历"]
+
+    F --> G{"pgd→p4d→pud\n→pmd→pte\nPTE状态?"}
+    G -->|"PTE为空\n(首次访问)"| I["do_anonymous_page()\n分配零页或COW页\n惰性分配触发"]
+    G -->|"PTE为swap条目\n(已被换出)"| J["do_swap_page()\n从swap换入页面\n重建映射"]
+    G -->|"PTE为文件页\n(文件映射)"| K["do_fault()\n从磁盘读取\n填入page cache"]
+    G -->|"PTE存在但写保护\n(COW触发)"| L["do_wp_page()\n写时复制处理\n多引用→分配新页\n单引用→解写保护"]
+
+    I --> M["设置PTE, 刷新TLB"]
+    J --> M
+    K --> M
+    L --> M
+
+    M --> N["返回用户态\n重新执行触发指令"]
+
+    style A fill:#dc2626,stroke:#b91c1c,color:#fff
+    style F fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style L fill:#f59e0b,stroke:#d97706,color:#000

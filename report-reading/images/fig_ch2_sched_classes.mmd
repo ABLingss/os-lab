@@ -1,0 +1,24 @@
+flowchart LR
+    subgraph "sched_class 优先级链 从高到低"
+        direction TB
+        A["stop_sched_class\n优先级 0\nCPU热插拔/任务迁移"] --> B["dl_sched_class\n优先级 1\n限期调度 SCHED_DEADLINE"]
+        B --> C["rt_sched_class\n优先级 99-2\n实时调度 SCHED_FIFO/RR"]
+        C --> D["fair_sched_class\n优先级 100-139\nCFS/EEVDF 公平调度"]
+        D --> E["idle_sched_class\n优先级 140\n每CPU空闲任务"]
+    end
+
+    subgraph "pick_next_task() 遍历顺序"
+        direction LR
+        F["for_each_active_class"] --> G["class->pick_next_task()"]
+        G -->|"找到任务"| H["返回 task_struct*"]
+        G -->|"未找到"| I["继续下一调度类"]
+        I --> G
+    end
+
+    A -.-> F
+
+    style A fill:#7c3aed,stroke:#6d28d9,color:#fff
+    style B fill:#dc2626,stroke:#b91c1c,color:#fff
+    style C fill:#f59e0b,stroke:#d97706,color:#000
+    style D fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style E fill:#6b7280,stroke:#4b5563,color:#fff

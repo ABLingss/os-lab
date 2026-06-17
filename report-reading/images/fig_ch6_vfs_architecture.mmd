@@ -1,0 +1,32 @@
+flowchart TD
+    subgraph "VFS层 (include/linux/fs.h)"
+        A["sys_open()\nfs/open.c"] --> B["do_sys_open()\n→ file_open_name()"]
+        B --> C["path_openat()\nfs/namei.c\n路径名解析"]
+        C --> D["link_path_walk()\n逐分量遍历\ndentry缓存查找"]
+        D --> E["do_open()\n→ vfs_open()"]
+        E --> F["do_dentry_open()\n设置file->f_op\n初始化文件描述符"]
+    end
+
+    subgraph "VFS四大核心对象"
+        G["super_block 超级块\n→ s_op\n每个挂载实例"]
+        H["inode 索引节点\n→ i_op 索引操作\n→ i_fop 文件操作"]
+        I["dentry 目录项\n→ d_op\n路径缓存dcache"]
+        J["file 文件对象\n→ f_op\n打开文件上下文"]
+    end
+
+    subgraph "ext2实现层 (fs/ext2/)"
+        K["ext2_file_operations\n.open .read_iter .write_iter\n.mmap .fsync .llseek"]
+        L["ext2_inode_operations\n.create .lookup .link\n.unlink .mkdir .rmdir"]
+        M["ext2_super_operations\n.write_inode .put_super\n.statfs .sync_fs"]
+    end
+
+    F --> G
+    F --> H
+    F --> I
+    F --> J
+    J -.-> K
+    H -.-> L
+    G -.-> M
+
+    style A fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style F fill:#059669,stroke:#047857,color:#fff

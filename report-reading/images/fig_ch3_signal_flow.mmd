@@ -1,0 +1,16 @@
+flowchart TD
+    A["send_signal()\n信号发送入口\nkernel/signal.c"] --> B["__send_signal_locked()\n加入目标进程pending队列"]
+    B --> C["prepare_signal()\n检查是否被忽略/阻塞"]
+    C --> D{"信号可否递送?"}
+    D -->|"忽略/阻塞"| END["直接返回"]
+    D -->|"可递送"| E["complete_signal()\n设置TIF_SIGPENDING标志\nsignal_wake_up()唤醒目标"]
+    E --> F["目标进程被唤醒\n返回用户态前\n检查TIF_SIGPENDING"]
+    F --> G["arch_do_signal_or_restart()\n信号处理分发\narch/x86/kernel/signal.c"]
+    G --> H["handle_signal()\n准备调用用户态handler"]
+    H --> I["setup_rt_frame()\n在用户栈构建信号帧\n保存原执行上下文"]
+    I --> J["修改用户态RIP\n指向handler入口\n返回用户态执行"]
+    J --> K["handler返回\n通过sigreturn()\n恢复原上下文"]
+
+    style A fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style E fill:#dc2626,stroke:#b91c1c,color:#fff
+    style G fill:#059669,stroke:#047857,color:#fff

@@ -1,0 +1,25 @@
+stateDiagram-v2
+    [*] --> 运行就绪态 : fork() / clone()
+    运行就绪态 --> 可中断睡眠 : 等待资源(wait_event)
+    可中断睡眠 --> 运行就绪态 : 信号唤醒 / wake_up()
+    运行就绪态 --> 不可中断睡眠 : 等待IO(wait_event)
+    不可中断睡眠 --> 运行就绪态 : IO完成 wake_up()
+    运行就绪态 --> 暂停态 : SIGSTOP / ptrace
+    暂停态 --> 运行就绪态 : SIGCONT
+    运行就绪态 --> 僵尸态 : do_exit()
+    僵尸态 --> [*] : 父进程wait()回收
+
+    note right of 运行就绪态
+        TASK_RUNNING (0x0000)
+        正在运行或在运行队列中
+    end note
+
+    note right of 可中断睡眠
+        TASK_INTERRUPTIBLE (0x0001)
+        可被信号唤醒
+    end note
+
+    note right of 不可中断睡眠
+        TASK_UNINTERRUPTIBLE (0x0002)
+        不响应信号(D状态)
+    end note

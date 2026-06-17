@@ -1,0 +1,38 @@
+sequenceDiagram
+    participant S as __schedule()
+    participant C as context_switch()
+    participant ST as switch_to 宏
+    participant ASM as __switch_to_asm()
+    participant SW as __switch_to()
+    participant CPU as x86 CPU
+
+    Note over S: kernel/sched/core.c
+
+    S->>C: context_switch(rq, prev, next, &rf)
+    Note over C: ① prepare_task_switch()
+    Note over C: ② switch_mm_irqs_off()→写入CR3
+    C->>ST: switch_to(prev, next, prev)
+    Note over ST: arch/x86/include/asm/switch_to.h
+    Note over ST: 展开为: last = __switch_to_asm(prev, next)
+    ST->>ASM: call __switch_to_asm
+
+    Note over ASM: arch/x86/entry/entry_64.S
+    Note over ASM: 步骤1: 保存prev现场
+    ASM->>CPU: pushq %rbp,%rbx,%r12-%r15
+    Note over ASM: 步骤2: 保存prev栈指针
+    ASM->>CPU: movq %rsp, TASK_threadsp(%rdi)
+    Note over ASM: 步骤3: 加载next栈指针
+    ASM->>CPU: movq TASK_threadsp(%rsi), %rsp
+    Note over ASM: ★★★ 执行流在此切换 ★★★
+
+    Note over ASM: 步骤4: 恢复next现场
+    ASM->>CPU: popq %r15,%r14,%r13,%r12,%rbx,%rbp
+    Note over ASM: 步骤5: 跳转C函数
+    ASM->>SW: jmp __switch_to
+
+    Note over SW: arch/x86/kernel/process_64.c
+    Note over SW: this_cpu_write(current_task, next)
+    Note over SW: switch_fpu() FPU/SIMD切换
+    Note over SW: __switch_to_xtra() DEBUG/IO等
+    SW-->>ST: 返回prev(即last=prev)
+    Note over ST: barrier() 上下文切换完成

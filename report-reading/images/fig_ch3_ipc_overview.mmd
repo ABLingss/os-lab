@@ -1,0 +1,22 @@
+flowchart TD
+    subgraph "System V IPC (ipc/ 目录)"
+        A["信号量 Semaphore\nipc/sem.c\nsemget/semctl/semop\n进程同步与互斥"]
+        B["消息队列 Message Queue\nipc/msg.c\nmsgget/msgsnd/msgrcv\n类型化消息传递"]
+        C["共享内存 Shared Memory\nipc/shm.c\nshmget/shmat/shmdt\n零拷贝, 最快IPC"]
+    end
+
+    subgraph "POSIX IPC"
+        D["POSIX信号量\nsem_open/sem_wait/sem_post"]
+        E["POSIX消息队列\nmq_open/mq_send/mq_receive"]
+        F["POSIX共享内存\nshm_open/mmap"]
+    end
+
+    subgraph "其他IPC机制"
+        G["信号 Signal\nkernel/signal.c\nSIGKILL/SIGTERM...\n异步事件通知"]
+        H["管道 Pipe & FIFO\nfs/pipe.c\n单向字节流\n64KB环形缓冲区"]
+        I["Unix域套接字\nnet/unix/\n本地流式通信"]
+    end
+
+    style A fill:#dc2626,stroke:#b91c1c,color:#fff
+    style B fill:#f59e0b,stroke:#d97706,color:#000
+    style C fill:#2563eb,stroke:#1d4ed8,color:#fff

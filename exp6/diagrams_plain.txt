@@ -1,0 +1,281 @@
+实验六：Linux内核初始化的主要过程与函数跳转流程（纯文字版）
+
+
+═══════════════════════════════════════════════════════════════
+  一、Linux内核初始化的主要过程（宏观七阶段）
+═══════════════════════════════════════════════════════════════
+
+阶段一：硬件上电
+──────────────────────────────────────────────────────────────
+  CPU 上电复位，进入 Real Mode (16-bit)
+  寄存器初始状态：CS=0xF000, EIP=0x0000FFF0（第一代IBM PC兼容约定）
+
+
+阶段二：BIOS / UEFI
+──────────────────────────────────────────────────────────────
+  1. POST (Power-On Self Test) — 上电自检
+     检测内存、CPU、外设是否正常
+  2. 初始化基本硬件（中断控制器、定时器、键盘控制器）
+  3. 根据启动顺序从硬盘/光驱/U盘读取引导扇区
+  4. 将 MBR（Master Boot Record，512 字节，含 446 字节引导代码）
+     加载到 0x7C00 内存地址，跳转执行
+
+
+阶段三：GRUB2 引导加载程序
+──────────────────────────────────────────────────────────────
+  Stage 1 (MBR 前 446 字节，或 GPT BIOS boot 分区)
+    → 加载 Stage 1.5（文件系统驱动代码，位于 MBR 和首分区之间）
+       → Stage 2：读取 /boot/grub/grub.cfg
+          → 显示启动菜单（或自动选择默认项）
+             → 加载内核镜像 /boot/vmlinuz-6.18.15 到内存
+                → 加载 initrd（init RAM disk）到内存
+                   → 设置内核命令行参数（cmdline）
+                      → 跳转到 bzImage 的 32 位 setup 入口点
+
+
+阶段四：内核 Setup 阶段（实模式 → 保护模式）
+──────────────────────────────────────────────────────────────
+  源代码位置：arch/x86/boot/
+
+  1. arch/x86/boot/header.S — 内核映像头
+     定义 setup_header 结构体，描述内核版本、加载地址、
+     入口点偏移量等引导协议参数。GRUB 读取此头以正确加载内核。
+
+  2. arch/x86/boot/main.c: main() — 实模式 C 程序
+     · init_default_io_ops()    初始化基本 I/O 操作
+     · copy_boot_params()       复制引导参数防止被覆盖
+     · detect_memory()          通过 int 0x15 (e820) BIOS 中断获取物理内存布局
+     · set_video()              设置显示模式（VGA/VESA）
+
+  3. arch/x86/boot/pm.c — 切换到保护模式
+     go_to_protected_mode()
+     · 加载 GDT（全局描述符表）
+     · 设置 CR0.PE = 1（Protection Enable）
+
+
+阶段五：内核解压与长模式切换（保护模式 → Long Mode）
+──────────────────────────────────────────────────────────────
+  源代码位置：arch/x86/boot/compressed/
+
+  1. arch/x86/boot/compressed/head_64.S
+     加载临时 GDT 和页表 → 检查 64-bit 支持 → 启用长模式
+
+  2. extract_kernel()
+     解压 vmlinux.bin.gz（piggy.S 嵌入的压缩数据）到最终内存位置
+
+  3. 启用 Long Mode（64-bit）
+     设置 EFER MSR 的 LME 位 (Long Mode Enable)
+     设置 CR0.PG = 1 (Paging)
+     跳转到解压后的 arch/x86/kernel/head_64.S
+
+
+阶段六：早期 64-bit 初始化（汇编阶段 → C 语言入口）
+──────────────────────────────────────────────────────────────
+  源代码位置：arch/x86/kernel/head_64.S → head64.c → init/main.c
+
+  1. arch/x86/kernel/head_64.S: startup_64 (行38)
+     架构无关的早期 64-bit 汇编入口
+     · __startup_64_setup_gdt_idt()  设置 64-bit GDT / IDT
+     · 计算内核 64-bit 虚拟地址偏移
+     · __startup_64()                建立早期页表 (early_top_pgt)
+       恒等映射（物理地址直接映射，用于过渡阶段）
+       内核虚拟地址映射（最终运行位置）
+
+  2. 进入 common_startup_64 (行198)
+     · 设置 initial_stack → 内核栈（位于 init_task 的栈区域）
+     · callq *initial_code(%rip)  → 跳转到 x86_64_start_kernel()
+
+  3. arch/x86/kernel/head64.c: x86_64_start_kernel() (行222)
+     · 清理 BSS 段（未初始化全局变量置零）
+     · copy_bootdata()            解析引导参数 (cmdline, initrd地址)
+     · load_ucode_bsp()           为 BSP（引导CPU）加载微码更新
+
+  4. x86_64_start_reservations() (行294)
+     · 加载早期 IDT 中断描述符表
+     · 调用 start_kernel() — 下面是 C 语言通用初始化
+
+
+  5. init/main.c: start_kernel() (行911) ← GDB 断点 #0
+     ★ 第一个体系结构无关 (architecture-independent) 的 C 函数
+     ★ 此时只有 BSP 一个 CPU 在运行
+     ★ 运行在 local_irq_disable() 关中断状态
+
+     start_kernel() 内部关键初始化顺序：
+     ┌─────────────────────────────────────────────────┐
+     │ set_task_stack_end_magic(&init_task)            │ ← init_task 栈边界标记
+     │ smp_setup_processor_id()                        │ ← 处理器 ID
+     │ boot_cpu_init()                                 │ ← BSP 信息
+     │ setup_arch(&command_line)                       │ ← ★ x86 架构特定初始化
+     │   └─ 内存区域枚举、memblock 分配器、ACPI        │
+     │   └─ 页表最终设置、代码/数据段配置              │
+     │ setup_command_line(cmdline)                     │ ← 保存内核命令行
+     │ setup_per_cpu_areas()                           │ ← Per-CPU 变量区域
+     │ build_all_zonelists(NULL)                       │ ← 内存 zone 链表
+     │ page_alloc_init()                               │ ← 页分配器初始化
+     │ parse_early_param() + parse_args()              │ ← 解析内核参数
+     │ trap_init()                                     │ ← IDT 最终设置
+     │ mm_init()                                       │ ← ★ buddy + slab + vmalloc
+     │ sched_init()                                    │ ← ★ 进程调度器 (CFS/RT/MFQ)
+     │ early_irq_init() + init_IRQ()                   │ ← 中断控制器
+     │ rcu_init()                                      │ ← RCU 机制
+     │ softirq_init()                                  │ ← 软中断
+     │ timekeeping_init() + time_init() + tick_init()  │ ← 时间子系统
+     │ console_init()                                  │ ← ★ 此后 printk 输出可见
+     │ rest_init()                                     │ ← ★ 最后一个调用（永不返回）
+     └─────────────────────────────────────────────────┘
+
+
+阶段七：创建进程 → 进入用户态
+──────────────────────────────────────────────────────────────
+  源代码位置：init/main.c: rest_init() (行711)
+
+  rest_init() 创建三个特殊进程：
+
+  1. PID=1 (init 进程) — 通过 user_mode_thread(kernel_init, ...)
+     ┌──────────────────────────────────────────────────┐
+     │ kernel_init() → kernel_init_freeable()           │
+     │   · 等待 kthreadd 就绪                           │
+     │   · 加载内置模块                                 │
+     │   · 初始化设备驱动 (do_basic_setup)              │
+     │   · 挂载根文件系统                               │
+     │   · 尝试按顺序执行 init 程序：                   │
+     │     /sbin/init → /etc/init → /bin/init → /bin/sh │
+     │                                                  │
+     │   QEMU 环境中：执行 /init (busybox shell)        │
+     │   真机环境：执行 /sbin/init (systemd)            │
+     └──────────────────────────────────────────────────┘
+
+  2. PID=2 (kthreadd) — 通过 user_mode_thread(kthreadd, ...)
+     ┌──────────────────────────────────────────────────┐
+     │ 内核线程守护者，负责创建和管理其他内核线程：     │
+     │   · ksoftirqd  — 软中断守护线程                  │
+     │   · kworker/u:xx — 工作队列线程                  │
+     │   · rcu_gp / rcu_par_gp — RCU 线程               │
+     └──────────────────────────────────────────────────┘
+
+  3. PID=0 (idle 进程) — 当前 CPU 进入空闲
+     ┌──────────────────────────────────────────────────┐
+     │ schedule_preempt_disabled()                      │
+     │ cpu_startup_entry(CPUHP_ONLINE)                  │
+     │   → do_idle() 循环                               │
+     │   → 无就绪任务时执行 HLT/MWAIT 指令              │
+     │   → 有任务时由调度器唤醒，切换到其他进程         │
+     │   → 永不返回此函数                               │
+     └──────────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════
+  二、Linux内核初始化的主要函数跳转流程（精确调用链）
+═══════════════════════════════════════════════════════════════
+
+（汇编阶段）
+startup_64()                                  arch/x86/kernel/head_64.S:38
+  └─ __startup_64_setup_gdt_idt()             设置 64-bit GDT / IDT
+       └─ __startup_64()                      建立早期页表 (early_top_pgt)
+            └─ common_startup_64()             .S:198, 设置 initial_stack
+                 └─ callq *initial_code(%rip)  .S:418, initial_code = x86_64_start_kernel
+
+（早期 C 语言阶段）
+x86_64_start_kernel()                         arch/x86/kernel/head64.c:222
+  ├─ copy_bootdata()                          解析引导参数 (cmdline, initrd)
+  ├─ load_ucode_bsp()                         为 BSP 加载 CPU 微码
+  └─ x86_64_start_reservations()              head64.c:294
+       ├─ 加载早期 IDT (early_idt_handler_array)
+       └─ start_kernel()                      init/main.c:911  ← GDB 断点
+
+（通用内核初始化阶段）
+start_kernel()                                init/main.c:911
+  │
+  ├─ set_task_stack_end_magic(&init_task)     标记 init_task 栈边界
+  ├─ smp_setup_processor_id()                 处理器 ID
+  ├─ boot_cpu_init()                          BSP 初始化
+  ├─ page_address_init()
+  ├─ setup_arch(&command_line)                ★ x86 架构初始化 (setup.c)
+  │    └─ 内存布局、memblock、ACPI、最终页表
+  ├─ setup_command_line(cmdline)              保存内核命令行
+  ├─ setup_nr_cpu_ids()                       CPU 数量
+  ├─ setup_per_cpu_areas()                    Per-CPU 变量区域
+  ├─ boot_cpu_state_init()
+  ├─ build_all_zonelists(NULL)                内存 zone 链表
+  ├─ page_alloc_init()                        页分配器
+  ├─ parse_early_param() + parse_args()       解析内核参数
+  ├─ trap_init()                              IDT 中断描述符表最终设置
+  ├─ mm_init()                                ★ buddy + slab + vmalloc
+  ├─ ftrace_init()
+  ├─ sched_init()                             ★ 调度器 (CFS/RT/MFQ/DL)
+  ├─ early_irq_init()                         早期中断初始化
+  ├─ init_IRQ()                               中断控制器初始化
+  ├─ rcu_init()                               RCU 机制
+  ├─ trace_init()
+  ├─ context_tracking_init()
+  ├─ softirq_init()                           软中断初始化
+  ├─ timekeeping_init()                       时间保持
+  ├─ time_init()                              定时器体系结构初始化
+  ├─ tick_init()                              时钟中断事件
+  ├─ console_init()                           ★ 控制台驱动 (此后 printk 可见)
+  └─ rest_init()                              ★ 最后一个调用 (永不返回)
+
+（进程创建阶段）
+rest_init()                                   init/main.c:711
+  ├─ rcu_scheduler_starting()                 RCU 调度器启动
+  ├─ user_mode_thread(kernel_init, ...)       → 创建 PID=1 (init 进程)
+  ├─ user_mode_thread(kthreadd, ...)          → 创建 PID=2 (内核线程守护者)
+  └─ schedule_preempt_disabled()
+       └─ cpu_startup_entry(CPUHP_ONLINE)     → 当前任务变为 PID=0 (idle)
+            └─ do_idle()                      空闲循环 (永不返回)
+
+（PID=1 分支）
+kernel_init()                                 init/main.c:1477
+  └─ kernel_init_freeable()                   init/main.c:1567
+       ├─ 等待 kthreadd 就绪
+       ├─ do_basic_setup()                    加载内置模块、初始化驱动
+       ├─ 挂载根文件系统 (/dev/sda2 → /)
+       └─ 尝试执行:
+            /sbin/init → /etc/init → /bin/init → /bin/sh
+            QEMU: /init (busybox sh)
+            真机: /sbin/init (systemd)
+       → 进入用户态，系统正常运行
+
+（PID=2 分支）
+kthreadd()                                    → 创建内核线程：
+  ├─ ksoftirqd/n                             软中断守护
+  ├─ kworker/u:x:x                           工作队列
+  └─ rcu_gp / rcu_par_gp                     RCU 线程
+
+（PID=0 分支）
+idle()                                        → 空闲循环
+  └─ do_idle()
+       └─ while(1) { schedule(); }           等待调度
+
+
+═══════════════════════════════════════════════════════════════
+  三、GDB 调试内核的截图
+═══════════════════════════════════════════════════════════════
+
+   请将以下 GDB 操作的截图插入此处：
+   1. GDB 连接 QEMU 并命中 start_kernel 断点
+   2. bt 栈回溯输出（调用链）
+   3. info registers 寄存器状态
+
+
+═══════════════════════════════════════════════════════════════
+  四、添加内核调试打印信息的输出截图
+═══════════════════════════════════════════════════════════════
+
+   在 /usr/src/linux-6.18.15/init/main.c 中添加的 printk：
+
+   --- start_kernel() 开头 (~行913) ---
+   printk(KERN_INFO "[EXP6] === start_kernel() called ===\n");
+
+   --- console_init() 之后 (~行1053) ---
+   printk(KERN_INFO "[EXP6] console initialized — printk now visible\n");
+
+   --- rest_init() 开头 (~行713) ---
+   printk(KERN_INFO "[EXP6] === rest_init() — creating init process ===\n");
+
+   预期 dmesg | grep EXP6 输出：
+   [EXP6] === start_kernel() called ===
+   [EXP6] console initialized — printk now visible
+   [EXP6] === rest_init() — creating init process ===
+
+   请将实际 dmesg 输出截图插入此处。

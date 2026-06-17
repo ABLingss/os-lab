@@ -1,0 +1,82 @@
+# === C / Kernel Module Build Artifacts ===
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# === Compiled Binaries (build output directory) ===
+bin/
+
+# === Compiled Test Executables in Experiment Directories ===
+# (C source = .c, compiled binaries have no extension)
+exp2/test_mycall
+exp3/philosophers
+exp4/producer_consumer
+exp5/mycp
+exp5/myls
+exp5/cpf
+exp5/cpto
+exp5/cpto_1
+exp8/test_deadlock
+exp10/mem_alloc
+exp10/mem_cow
+exp10/mem_cow_auto
+exp10/mem_cow_quick
+exp10/mem_cow_verify
+exp10/mem_observe
+exp10/mem_quick_test
+exp10/mem_mmap_test
+exp11/mfq_test
+
+# Experiment build outputs (test images, data)
+exp9/*.img
+exp9/enc.bin
+
+# === LaTeX ===
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+*.xdv
+*.nav
+*.snm
+*.vrb
+*.bbl
+*.blg
+*.lot
+*.lof
+_build/
+*.run.xml
+*.bcf
+
+# === Editor / IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# === OS Files ===
+Thumbs.db
+.directory
+
+# === Claude Code Local Settings (do not commit) ===
+.claude/settings.local.json
+
+# === External Projects (tracked in their own repos) ===
+moon-bridge/
+
+# === Large / Binary Reference Files ===
+*.docx
+*.doc
+report-reading/*.pptx
+《计算机操作系统（第4版）》学习指导与题解.pdf

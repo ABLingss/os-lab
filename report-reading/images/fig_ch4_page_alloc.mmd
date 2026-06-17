@@ -1,0 +1,34 @@
+flowchart TD
+    subgraph "伙伴系统 分配路径 (mm/page_alloc.c)"
+        A["alloc_pages()\n页分配入口"] --> B["__alloc_pages()"]
+        B --> C["__alloc_pages_noprof()\nNUMA感知分配"]
+        C --> D["get_page_from_freelist()\n遍历各内存区域zone"]
+        D --> E{"free_area[order]\n有空闲块?"}
+        E -->|"有"| F["__rmqueue()\n从free_area移除"]
+        E -->|"无"| G["__alloc_pages_slowpath()\n内存压缩 / 回收 / OOM"]
+        F --> H["必要时分裂高阶块\nsplit_page / expand()"]
+        H --> I["返回 struct page*"]
+    end
+
+    subgraph "伙伴系统 释放路径"
+        J["__free_pages()"] --> K["__free_one_page()\n查找buddy伙伴页框"]
+        K --> L{"buddy同阶且空闲?"}
+        L -->|"是"| M["合并为高一阶块\n递归检查高阶buddy"]
+        L -->|"否"| N["加入free_area[order]\n停止合并"]
+        M --> L
+    end
+
+    subgraph "内存区域 Zones"
+        O["ZONE_DMA\n0-16MB\n传统ISA DMA"]
+        P["ZONE_DMA32\n16MB-4GB\n32位DMA设备"]
+        Q["ZONE_NORMAL\n4GB以上\n内核直接映射"]
+        R["ZONE_MOVABLE\n可热插拔\n防碎片"]
+    end
+
+    I -.-> O
+    I -.-> P
+    I -.-> Q
+
+    style A fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style F fill:#059669,stroke:#047857,color:#fff
+    style G fill:#dc2626,stroke:#b91c1c,color:#fff

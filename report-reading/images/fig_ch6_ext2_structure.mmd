@@ -1,0 +1,38 @@
+flowchart TD
+    subgraph "ext2 磁盘总布局"
+        A["引导块 Boot Block\n1024字节"] --> B["块组 0"]
+        B --> C["块组 1"]
+        C --> D["..."]
+        D --> E["块组 N"]
+    end
+
+    subgraph "单个块组 Block Group 内部"
+        direction TB
+        F["超级块 Super Block\n备份副本在组0,1,3,5,7...\nstruct ext2_super_block"]
+        G["组描述符 Group Descriptors\n块位图/inode位图/inode表位置\n空闲计数"]
+        H["块位图 Block Bitmap\n每bit对应一个数据块\n0=空闲 1=已用"]
+        I["inode位图 Inode Bitmap\n每bit对应一个inode\n0=空闲 1=已用"]
+        J["inode表 Inode Table\nstruct ext2_inode数组\n每个inode 128字节"]
+        K["数据块 Data Blocks\n实际文件内容\n目录项/间接寻址块"]
+    end
+
+    subgraph "ext2_inode 结构 128字节"
+        L["i_mode 文件类型+权限"]
+        M["i_block[15] 数据块指针\n[0..11] 12个直接块\n[12] 一级间接块\n[13] 二级间接块\n[14] 三级间接块"]
+        N["i_size 文件大小(字节)"]
+        O["i_blocks 占用块数(512B单位)"]
+    end
+
+    B -.-> F
+    B -.-> G
+    B -.-> H
+    B -.-> I
+    B -.-> J
+    B -.-> K
+    J -.-> L
+    J -.-> M
+    J -.-> N
+
+    style A fill:#6b7280,stroke:#4b5563,color:#fff
+    style F fill:#f59e0b,stroke:#d97706,color:#000
+    style J fill:#059669,stroke:#047857,color:#fff

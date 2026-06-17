@@ -1,0 +1,26 @@
+flowchart TD
+    subgraph "用户空间"
+        A["mmap() / malloc()\nmm/mmap.c\n创建虚拟内存映射"]
+    end
+
+    subgraph "内核VMA管理"
+        A --> B["do_mmap()\n计算对齐地址和长度"]
+        B --> C["mmap_region()\n分配vm_area_struct"]
+        C --> D["设置vm_start/vm_end\nvm_flags/vm_prot\nvm_ops/vm_file"]
+        D --> E["vma_link()\n插入mm->mmap链表\n插入mm->mm_rb红黑树\n提交到地址空间"]
+    end
+
+    subgraph "vm_area_struct 结构"
+        F["struct vm_area_struct {\n  vm_start, vm_end\n  vm_flags (READ|WRITE|EXEC|SHARED...)\n  vm_file (文件映射)\n  vm_pgoff (文件偏移)\n  vm_ops → fault/page_mkwrite\n}"]
+    end
+
+    subgraph "惰性分配 缺页时触发"
+        G["首次访问→缺页异常\n→handle_mm_fault()\n→do_anonymous_page()/do_fault()"]
+        H["PTE写入, TLB刷新\n→ 用户态完全透明"]
+    end
+
+    D -.-> F
+    G --> H
+
+    style B fill:#2563eb,stroke:#1d4ed8,color:#fff
+    style E fill:#059669,stroke:#047857,color:#fff

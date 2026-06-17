@@ -1,0 +1,63 @@
+# 实验7：Linux设备文件与驱动程序 — 内核模块 Makefile
+#
+# 用法：
+#   make               — 编译所有模块
+#   make hello         — 仅编译 hello_module
+#   make char_driver   — 仅编译 char_driver
+#   make clean         — 清理
+#
+# 注意：需要已编译好的内核源码树
+
+# 内核源码路径（根据实际情况修改）
+KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+# 如果是自己编译的内核，可能需要：
+# KERNELDIR ?= /usr/src/linux-6.18.15
+
+PWD := $(shell pwd)
+
+obj-m += hello_module.o
+obj-m += char_driver.o
+
+# hello_module 的源文件（如果文件名不匹配，用下面的方式指定）
+# hello_module-objs := exp7_hello_module.o
+
+all: hello_module.ko char_driver.ko
+
+hello_module.ko: exp7_hello_module.c
+	cp exp7_hello_module.c hello_module.c
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+	rm -f hello_module.c
+
+char_driver.ko: exp7_char_driver.c
+	cp exp7_char_driver.c char_driver.c
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
+	rm -f char_driver.c
+
+hello: hello_module.ko
+
+char_driver: char_driver.ko
+
+clean:
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+	rm -f hello_module.c char_driver.c
+	rm -f modules.order Module.symvers
+
+help:
+	@echo "实验7 Makefile 使用说明"
+	@echo "  make            编译所有内核模块"
+	@echo "  make hello      仅编译基础模块"
+	@echo "  make char_driver  仅编译字符驱动"
+	@echo "  make clean      清理"
+	@echo ""
+	@echo "加载模块:"
+	@echo "  sudo insmod hello_module.ko"
+	@echo "  sudo insmod char_driver.ko (自动创建 /dev/mychardev)"
+	@echo ""
+	@echo "卸载模块:"
+	@echo "  sudo rmmod char_driver"
+	@echo "  sudo rmmod hello_module"
+	@echo ""
+	@echo "测试:"
+	@echo "  gcc exp7_test_driver.c -o test_driver && ./test_driver"
+
+.PHONY: all hello char_driver clean help

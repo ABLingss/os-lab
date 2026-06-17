@@ -1,0 +1,68 @@
+classDiagram
+    class task_struct {
+        +unsigned int __state
+        +int prio 动态优先级
+        +int static_prio 静态优先级
+        +int normal_prio
+        +unsigned int policy
+        +struct sched_entity se
+        +struct sched_rt_entity rt
+        +struct sched_dl_entity dl
+        +struct mm_struct* mm
+        +struct mm_struct* active_mm
+        +struct thread_struct thread
+        +cpumask_t cpus_mask
+        +int on_cpu
+        +struct list_head tasks
+        +pid_t pid 进程ID
+    }
+
+    class sched_entity {
+        +struct load_weight load
+        +struct rb_node run_node
+        +unsigned int on_rq
+        +u64 exec_start
+        +u64 sum_exec_runtime
+        +u64 vruntime 虚拟运行时间
+        +u64 deadline 虚拟截止时间
+        +u64 min_vruntime
+        +u64 vlag 滞后值
+        +struct sched_entity* parent
+        +struct cfs_rq* cfs_rq
+    }
+
+    class cfs_rq {
+        +struct load_weight load
+        +unsigned int nr_running
+        +unsigned int h_nr_running
+        +u64 min_vruntime
+        +struct rb_root_cached tasks_timeline
+        +struct sched_entity* curr
+        +struct sched_entity* next
+        +struct sched_entity* last
+    }
+
+    class rq {
+        +unsigned int nr_running
+        +struct cfs_rq cfs
+        +struct rt_rq rt
+        +struct dl_rq dl
+        +struct task_struct* curr
+        +struct task_struct* idle
+        +int cpu
+    }
+
+    class thread_struct {
+        +unsigned long sp 内核栈指针
+        +unsigned long sp0
+        +unsigned long usersp
+        +unsigned long fs
+        +unsigned long gs
+        +struct fpu fpu
+    }
+
+    task_struct "1" *-- "1" sched_entity : 嵌入se字段
+    task_struct "1" *-- "1" thread_struct : 嵌入thread字段
+    rq "1" *-- "1" cfs_rq : 嵌入cfs字段
+    cfs_rq "1" o-- "*" sched_entity : 红黑树tasks_timeline
+    rq "1" o-- "1" task_struct : curr指针
