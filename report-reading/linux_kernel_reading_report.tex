@@ -304,7 +304,33 @@ void __sched schedule(void) {
 }
 \end{lstlisting}
 
-\texttt{\_\_schedule()} 是真正的调度决策函数，完成\textbf{选任务 → 切上下文}全流程。理解该函数的关键在于认识到：调用 \texttt{schedule()} 的进程将自己视为"prev"——它主动交出 CPU，期望调度器选择另一个进程（"next"）运行。但 \texttt{\_\_schedule()} 返回后，调用者可能不再是之前那个进程——如果调度器选择了不同的 next，则 \texttt{context\_switch()} 将 CPU 的控制权转移到 next 的上下文，而 prev 在 \texttt{\_\_schedule()} 中的执行被"冻结"，直到将来某次调度再次选择它时从 \texttt{context\_switch()} 返回继续执行。这种"分裂返回"语义是理解整个调度器和上下文切换机制的核心。
+\texttt{\_\_schedule()} 是真正的调度决策函数，完成\textbf{选任务 → 切上下文}全流程。理解该函数的关键在于认识到：调用 \texttt{schedule()} 的进程将自己视为"prev"——它主动交出 CPU，期望调度器选择另一个进程（"next"）运行。
+
+\textbf{分裂返回}是该函数最反直觉的语义。以下从 prev 和 next 两个视角展示一次完整的调度-切换-返回全时序：
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{\_\_schedule() 分裂返回：prev 与 next 的双视角时序}
+\label{tab:split_return}
+\begin{tabular}{llP{5.5cm}P{4.5cm}}
+\toprule
+\textbf{步骤} & \textbf{执行者} & \textbf{prev 视角} & \textbf{next 视角} \\
+\midrule
+1 & prev & \texttt{schedule() → \_\_schedule()} 入口，prev 将自己设为当前任务 & next 此时可能在就绪队列中等待，或在某个等待队列中睡眠 \\
+2 & prev & \texttt{pick\_next\_task()} 选中 next & （无感知）\\
+3 & prev & \texttt{context\_switch()} 执行 \texttt{switch\_mm\_irqs\_off()} 切换地址空间 & （无感知）\\
+4 & prev & \texttt{switch\_to(prev, next, prev)} → \texttt{\_\_switch\_to\_asm}：\texttt{push r15..rbp} 保存到 prev 内核栈，\texttt{mov \%rsp, prev->thread.sp} & （无感知）\\
+$\blacktriangleright$ & \textbf{RSP切换点} & \texttt{mov next->thread.sp, \%rsp}：从此 RSP 指向 next 的内核栈 & \texttt{pop r15..rbp}：恢复上次自己被切出时的寄存器，\texttt{jmp \_\_switch\_to} \\
+5 & next & prev 的指令流在此冻结，CPU 继续执行但"prev 不知道" & \texttt{\_\_switch\_to()} 收尾：更新 \texttt{current\_task}、切换 FPU/FSGSBASE、返回 prev 指针 \\
+6 & next & （冻结中）& \texttt{context\_switch()} 返回 → \texttt{\_\_schedule()} 返回 → \texttt{schedule()} 返回。next 继续执行自己的业务逻辑 \\
+7 & 将来的调度 & 某次调度器再次选中 prev，从 \texttt{prev->thread.sp} 恢复 RSP，\texttt{pop} 寄存器，\texttt{jmp \_\_switch\_to} → prev 从 \texttt{context\_switch} 返回 & （无感知）\\
+8 & prev & prev 从 \texttt{\_\_schedule()} 返回，继续执行——它对步骤 5-7 之间发生的一切毫无记忆 & （可能已被切出）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这张表揭示了一个关键事实：\textbf{prev 在 \texttt{\_\_switch\_to\_asm} 的 RSP 切换指令处被"冻结"，而 CPU 从此刻开始执行的是 next 的代码}。prev 内核栈上压着它的 callee-saved 寄存器，\texttt{prev->thread.sp} 指向那个位置。将来 prev 被再次调度时，\texttt{\_\_switch\_to\_asm} 后半段把寄存器全部弹回，\texttt{jmp \_\_switch\_to} 进入 C 函数，然后一路返回到 \texttt{context\_switch} → \texttt{\_\_schedule} → \texttt{schedule}。prev 对切换期间的所有事件（中断、其他进程的执行、时钟推进）完全无感知——它的"时间"在 RSP 切换点暂停，在恢复点继续。这就是为什么调度器代码中 \texttt{schedule()} 之后的代码不能假设任何有关"刚才发生了什么"的事情——你所在的 CPU 可能已经运行过数十个其他进程，你的 cache 行可能全部被逐出，你的 TLB 条目可能已被覆盖。这种"分裂返回"语义是理解整个调度器和上下文切换机制的核心。
 
 \begin{lstlisting}[language=C, caption={\_\_schedule() 核心流程（kernel/sched/core.c）}, label={lst:__schedule}]
 static void __sched notrace __schedule(int sched_mode) {
@@ -464,6 +490,8 @@ static struct sched_entity *__pick_eevdf(struct cfs_rq *cfs_rq) {
 
 \texttt{entity\_eligible()} 内部比较实体的 \texttt{vlag}：若 \texttt{vlag >= 0}，说明该实体尚未获得应得的 CPU 时间，具有 eligibility；若 \texttt{vlag < 0}，说明实体已超额运行，需等待其他实体追赶。
 
+\textbf{为什么 EEVDF 需要 eligibility 检查——CFS 的"唤醒风暴"问题。}经典 CFS 按最小 vruntime 选进程。考虑一个场景：100 个进程每 10ms 做一次 \texttt{read()} 等待磁盘 I/O，还有一个纯 CPU 计算的进程在后台。每次 I/O 完成，唤醒的进程 vruntime 极小（它睡了很久，vruntime 没增长），于是 \texttt{pick\_next\_task\_fair} 立刻选它、抢占当前 CPU 进程。100 个进程 × 每秒 100 次唤醒 = 每秒 100 次上下文切换，CPU 的大量时间消耗在切换本身而非实际计算。EEVDF 用 eligibility 解决了这个问题：刚被唤醒的进程虽然在就绪队列中，但它的 vlag 为负——它睡觉期间没有"消费"CPU，但从系统的角度看，它"欠"了其他一直在就绪的进程。只有等 vlag 归零（其他进程追赶上它的 vruntime），该进程才算 eligible，才能被 \texttt{pick\_next\_entity} 选中。这本质上是把调度决策从"谁最缺 CPU"变为"谁既不缺 CPU、deadline 又最近"\cite{sched_eevdf,lwn_eevdf}。
+
 \subsubsection{时钟中断与抢占检查 — scheduler\_tick()}
 
 每次时钟中断触发 \texttt{scheduler\_tick()}，调用链为 \texttt{scheduler\_tick() → task\_tick\_fair() → entity\_tick()}：
@@ -520,6 +548,8 @@ void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
 \end{lstlisting}
 
 \texttt{load\_new\_mm\_cr3()} 通过 \texttt{write\_cr3()} 内联汇编写入 CR3 寄存器。现代 x86 处理器支持 PCID（Process-Context Identifier），允许 TLB 条目携带地址空间标签，避免每次 CR3 写入时全量刷新 TLB。\texttt{choose\_new\_asid()} 函数负责分配新的 ASID 并决定是否需要 TLB 刷新\cite{intel_sdm}。
+
+\textbf{PCID 的一个常见误解需要澄清}：PCID 不是"让上下文切换不刷新 TLB"——它的实际效果更微妙。没有 PCID 时，写入 CR3 刷新\textbf{全部} TLB 条目，包括内核空间那些标记为 Global 的条目（它们本该对所有进程有效）。有了 PCID，每个进程拥有独立的 ASID（Address Space Identifier），其 TLB 条目仅在 ASID 匹配时命中。这意味着：① 切换到新进程时不必显式刷新 TLB——旧 ASID 的条目自然不会被新 ASID 的访问匹配到；② 内核空间的 Global 条目在 CR3 写入后仍然存活——这些条目对性能至关重要（内核代码路径、中断处理、系统调用入口）；③ 当切换回一个刚离开不久的进程时，其 TLB 条目可能仍在（取决于 TLB 容量），可实现部分复用。PCID 的真正价值是"让无关进程的 TLB 条目在硬件中和平共存"，而非单纯"免刷新"\cite{intel_sdm}。
 
 \subsubsection{执行现场切换 — switch\_to 宏 → \_\_switch\_to\_asm}
 
@@ -602,6 +632,15 @@ struct task_struct *__switch_to(struct task_struct *prev,
 \end{lstlisting}
 
 \texttt{switch\_fpu()} 是其中的性能关键点。现代处理器（支持 XSAVE/AVX/AMX）的 FPU 状态可达数 KB，每次上下文切换都完整保存和恢复将带来显著开销。Linux 通过\textbf{惰性 FPU 切换}优化：\texttt{switch\_fpu()} 仅将 prev 的 FPU 状态标记为"脏"（若其实际使用过 FPU），而不立即保存；只有当下一次调度选择使用 FPU 的其他进程时，才通过 \texttt{xsave} 指令保存 prev 的 FPU 状态到 \texttt{prev->thread.fpu}，并通过 \texttt{xrstor} 恢复 next 的状态。若 prev 从未使用过 FPU（如纯整数计算进程），整个保存步骤被省略\cite{amd_apm}。
+
+\textbf{上下文切换的真实成本。}表面上看，\texttt{\_\_switch\_to\_asm} 只做了 6 个 push + RSP 切换 + 6 个 pop + 1 个 jmp，约 20 条指令、几十个 cycle。但这只是冰山浮尖。真正的开销在切换之后：
+
+\begin{itemize}[leftmargin=*]
+    \item \textbf{TLB 失效}：CR3 写入后，若无 PCID，整个 TLB 被刷新。新进程的每次内存访问都是 TLB miss——页表遍历需要 4 次内存访问（pgd→p4d→pud→pmd→pte，五级页表），每次约 10–20 cycles。进程恢复执行后的前几十次访存几乎全部 TLB miss。
+    \item \textbf{Cache 污染}：L1/L2/L3 cache 中填满了 prev 的数据。next 的代码和数据首次访问几乎必定 cache miss——L2 miss 约 40 cycles，L3 miss 约 200 cycles，DRAM 访问约 200ns。
+    \item \textbf{分支预测器状态错位}：现代 CPU 的分支预测器使用全局历史（过去若干分支的 taken/not-taken 模式）做预测。切换到 next 后，分支预测器看到的是 prev 的历史、执行的是 next 的代码——前几十个分支几乎随机预测，平均 2–3 次误预测（每次约 20 cycles 的流水线冲刷）。
+    \item \textbf{综合估算}：一次完整的上下文切换（含 CR3 写入），在无 PCID 的 x86\_64 处理器上，真实开销在 \textbf{3,000–10,000 cycles}。其中 \texttt{\_\_switch\_to\_asm} 的指令执行本身占比不到 1\%。引入 PCID 后 TLB 刷新被避免，但 cache 污染和分支预测器偏移仍然存在\cite{intel_sdm}。
+\end{itemize}
 
 上下文切换的完整调用时序如\figref{fig_ch2_switch_to_asm}所示。
 
@@ -1003,19 +1042,33 @@ DEFINE_SCHED_CLASS(mfq) = {
 
 其中 \texttt{update\_curr}, \texttt{set\_cpus\_allowed}, \texttt{prio\_changed} 均为空操作——核心调度器无条件调用这些回调，但 MFQ 不需要这些钩子执行实际逻辑，因此提供空函数以满足接口要求。\texttt{select\_task\_rq\_mfq} 实现了简单的 CPU 选择：若为唤醒路径（\texttt{WF\_TTWU}）且任务有记录的 last-run CPU（\texttt{wake\_cpu}），则选择该 CPU（利用 cache 热度）；否则保持在当前 CPU。
 
-\subsubsection{完整调用链示例}
+\subsubsection{完整调用链示例：一次抢占切换的逐层追踪}
 
-以下是一次典型的 MFQ 调度完整时序，从时钟中断触发到上下文切换结束：
+以下选择具体场景来展示 MFQ 调度器在一次抢占切换中的完整调用链：P1 是 CPU-bound 进程，已降级至 L3（时间片 80 ticks，剩余 1 tick）；P2 是 I/O-bound 进程，刚完成 I/O 被唤醒至 L0（时间片 10 ticks）。当时钟中断触发 P1 时间片耗尽时，从硬件到调度器到寄存器切换的完整时序如下：
 
-\begin{enumerate}[leftmargin=*]
-    \item \textbf{时钟中断} → \texttt{scheduler\_tick() → task\_tick\_mfq()}。task\_tick\_mfq 递减 \texttt{time\_slice}，当耗尽时执行 \texttt{queue\_level++} 降级并调用 \texttt{resched\_curr(rq)} 设置 \texttt{TIF\_NEED\_RESCHED}。
-    \item \textbf{中断返回} → \texttt{exit\_to\_user\_mode\_loop()} 检测到 \texttt{TIF\_NEED\_RESCHED}，调用 \texttt{schedule()}。
-    \item \texttt{schedule() → \_\_schedule() → pick\_next\_task() → \_\_pick\_next\_task()}。在 \texttt{for\_each\_active\_class} 遍历中，若当前 CPU 上仅有 MFQ 任务，快速路径不命中，进入慢速路径按 stop→dl→rt 逐个调用 \texttt{pick\_next\_task}（均返回 NULL），最终调用 \texttt{mfq\_sched\_class.pick\_task → pick\_task\_mfq()}。
-    \item \texttt{pick\_task\_mfq()} 从 L0 开始扫描队列，找到非空队列后通过 \texttt{list\_first\_entry} 取出队首任务。
-    \item \texttt{context\_switch(rq, prev, next, \&rf)}：先 \texttt{put\_prev\_task\_mfq() → lock/unlock} 维护抢占计数，再 \texttt{set\_next\_task\_mfq() → list\_del\_init} 将 next 从就绪队列中移除（标记为正在运行）。
-    \item \texttt{switch\_mm\_irqs\_off() → load\_new\_mm\_cr3()} 写入 CR3 切换地址空间。
-    \item \texttt{switch\_to(prev, next, prev) → \_\_switch\_to\_asm()}：压栈 prev 的 callee-saved 寄存器 → 切换 RSP → 弹栈 next 的寄存器 → \texttt{jmp \_\_switch\_to} 完成架构收尾。
-\end{enumerate}
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{MFQ 调度抢占切换全时序 — P1(L3,CPU-bound) → P2(L0,I/O-bound)}
+\label{tab:mfq_timing}
+\begin{tabular}{p{0.5cm}p{2.5cm}p{2.5cm}p{3cm}p{4cm}p{2cm}}
+\toprule
+\textbf{\#} & \textbf{硬件层} & \textbf{中断/抢占} & \textbf{核心调度器} & \textbf{MFQ 调度器} & \textbf{用户进程} \\
+\midrule
+1 & APIC 定时器中断，CPU 保存 RIP/RFLAGS 到内核栈 & \texttt{scheduler\_tick()} 入口，rq->lock 已持 & 调用 \texttt{curr->sched\_class->task\_tick} & \texttt{task\_tick\_mfq(P1)}：\texttt{time\_slice--} → 0 → \texttt{queue\_level=3→4} → \texttt{resched\_curr()} 设 TIF\_NEED\_RESCHED & P1 正在用户态执行计算循环 \\
+2 & — & 中断返回路径：\texttt{exit\_to\_user\_mode\_loop()} 检测 TIF\_NEED\_RESCHED & 调用 \texttt{schedule() → \_\_schedule()}，prev=P1 & — & — \\
+3 & — & — & \texttt{pick\_next\_task()}：快速路径不命中（prev 非 CFS），进入 \texttt{\_\_pick\_next\_task()} & 遍历 stop→dl→rt 均为空，\texttt{for\_each\_active\_class} 走到 mfq & — \\
+4 & — & — & — & \texttt{pick\_task\_mfq()}：扫描 L0→L7，L0 非空（P2 被唤醒在这里），\texttt{list\_first\_entry} 取 P2 & — \\
+5 & — & — & \texttt{context\_switch(P1, P2)} 入口 & \texttt{put\_prev\_task\_mfq}：lock/unlock 维护计数 & P1 即将被"冻结" \\
+6 & — & — & — & \texttt{set\_next\_task\_mfq(P2)}：\texttt{list\_del\_init} 将 P2 从 L0 队列移除（标记为正在运行） & — \\
+7 & \texttt{write\_cr3(next->pgd)}：切换地址空间，若 P2 的 mm 不同于 P1，TLB 开始渐进刷 & \texttt{switch\_mm\_irqs\_off()} → \texttt{load\_new\_mm\_cr3()} & — & — & — \\
+8 & \texttt{mov \%rsp, prev->thread.sp}：保存 P1 的 RSP；\texttt{mov next->thread.sp, \%rsp}：切换到 P2 的内核栈 ← RSP 切换点 & \texttt{switch\_to} → \texttt{\_\_switch\_to\_asm}：push r15..rbp（P1 的），切换到 P2 栈，pop r15..rbp（P2 的）& — & — & P1 在此冻结，P2 开始恢复 \\
+9 & \texttt{jmp \_\_switch\_to} → 更新 current\_task 为 P2 → 切换 FPU/FSGSBASE & \texttt{context\_switch} 返回 → \texttt{\_\_schedule} 返回 → \texttt{schedule} 返回 & — & — & P2 从中断返回，回到用户态继续执行 I/O 循环（它之前调用 \texttt{usleep} 阻塞）\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{这张表把五层（硬件→中断→核心调度器→MFQ 调度器→用户进程）放在一根时间轴上}，每层的操作在同一行中对齐。其中第 8 行的 RSP 切换是整个链路最关键的一个指令对——在此之前，CPU 运行 P1 的内核代码；在此之后，CPU 运行 P2 的内核代码。P1 在 \texttt{mov \%rsp, prev->thread.sp} 之后被"冻住"，它的内核栈上压着 r15/r14/r13/r12/rbx/rbp 六个寄存器的值，\texttt{prev->thread.sp} 指向那个位置。将来某次调度器再次选中 P1 时，\texttt{\_\_switch\_to\_asm} 的后半段会从 \texttt{next->thread.sp}（那时 P1 是 next）恢复 RSP，依次弹出六个寄存器，\texttt{jmp \_\_switch\_to} → 一路返回到 \texttt{context\_switch → \_\_schedule → schedule}，P1 的时间继续流动——它对中间发生的一切毫无记忆。
 
 \subsubsection{用户态调用}
 
@@ -1039,9 +1092,35 @@ for (int i = 0; i < 4; i++) {
 
 验证结果：I/O-bound 子进程由于频繁 sleep→wakeup 触发 \texttt{wakeup\_preempt\_mfq} 升级，始终保持 L0/L1 高优先级，优先获得 CPU；CPU-bound 子进程逐级降级至 L4–L7，在后台完成批量计算。所有子进程正常退出，验证了从调度类注册到用户态调用的完整链路。
 
+\subsubsection{调度器接口契约：从四个典型错误理解内核设计意图}
+
+调度器回调接口的语义并不总是能从函数名直接推断。以下四个在实现 MFQ 过程中暴露的问题，每个都对应一个非显式的内核设计约束，理解这些约束对阅读任何调度器源码都有帮助：
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{MFQ 实验做的时候遇到的一些问题和思考}
+\label{tab:mfq_bugs}
+\begin{tabular}{p{2.5cm}p{3cm}p{8cm}}
+\toprule
+\textbf{Bug} & \textbf{表面症状} & \textbf{根因} \\
+\midrule
+\textbf{\#1} 实现 \texttt{pick\_next\_task} → 全系统死锁 & 任务被选中后既不从队列移除也不设 curr，队列状态逐渐损坏 & \textbf{核心调度器的契约式接口}：有 \texttt{pick\_next\_task} 的调度类必须自管理队列（put\_prev + set\_next 全包）。RT 调度器只实现 \texttt{pick\_task}（不含 next），把队列维护委托给核心的 \texttt{put\_prev\_set\_next\_task()}。MFQ 跟随 RT 模式，删掉 \texttt{pick\_next\_task} 改用 \texttt{pick\_task}，死锁解除。接口的存在与否本身就是信号。 \\
+\midrule
+\textbf{\#2} \texttt{task\_tick\_mfq} 内调 \texttt{pr\_info} → scheduling while atomic panic & 内核 BUG 在 \texttt{core.c:6956}，preempt\_count 异常 & \textbf{原子上下文铁律}：定时器中断已持有 \texttt{rq->lock}，MFQ 的 \texttt{mrq->lock} 嵌套在内——双 spinlock 上下文中 \texttt{printk} 可能触发 console 驱动 → 尝试获取某锁 → 若锁被其他进程持有则调度 → panic。在内核热路径中，所有可能触发调度的操作（内存分配、日志输出、copy\_to/from\_user）都是禁区。删掉全部 \texttt{pr\_info} 后通过。 \\
+\midrule
+\textbf{\#3} \texttt{put\_prev\_task\_mfq} 的 \texttt{if(RUNNING)\{list ops\}} → preempt\_count 泄露 1 & 进程退出时 \texttt{do\_task\_dead → BUG()}，\texttt{exited with preempt\_count 1} & \textbf{PREEMPT\_DYNAMIC 的复杂性}：即使在 \texttt{if(prev->\_\_state == TASK\_RUNNING)} 条件体中放入 list 操作（且 body 从不执行——prev 是 TASK\_DEAD），编译器生成的地址计算代码仍可能干扰 \texttt{preempt\_count} 的锁追踪。通过 QEMU 对照实验精确缩小到"lock + if(RUNNING)\{list\_del\_init; list\_add\_tail\} + unlock"的组合 → 崩溃；替换 body 为 \texttt{barrier()} → 通过。当前方案只做 lock/unlock。这是真实内核调试中最诡异的一类 bug。 \\
+\midrule
+\textbf{\#4} \texttt{sched\_setscheduler(SCHED\_MFQ) → EINVAL} & glibc 拒绝 policy=4 & \textbf{内核-用户态的纵深防御}：\texttt{valid\_policy()} 是内核侧防御线——它决定哪些 policy 值被接受。glibc 的 \texttt{sched\_setscheduler()} 包装函数另有自己的白名单——它拒绝未知值，根本不到内核。这意味着自定义调度策略需要经过三道栅栏：① UAPI 头定义（\texttt{\#define SCHED\_MFQ 4}）；② 内核 \texttt{valid\_policy()} 扩展；③ 用户态用 \texttt{syscall()} 绕过 glibc。每道栅栏独立运行——纵深防御。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这四个问题从不同角度揭示了内核调度子系统的的设计约束：接口契约决定调度类的职责边界（Bug 1），原子上下文限制热路径中的可调用函数集（Bug 2），\texttt{PREEMPT\_DYNAMIC} 与 \texttt{DEBUG\_PREEMPT} 的交互影响锁追踪行为（Bug 3），内核-用户态之间的多层校验构成纵深防御（Bug 4）。对调度器源码的任何修改都不能脱离这些约束来理解。
+
 \subsection{实验验证}
 
-\textbf{实验11（MFQ 调度器实现）}：实现了 \texttt{SCHED\_MFQ}（policy=4）调度类，8 级多级反馈队列（L0–L7，时间片 \texttt{10 << level} ticks），修改涉及 8 个内核文件。QEMU 验证通过：I/O-bound 进程保持高优先级先完成，CPU-bound 进程逐级降级后完成。
+\textbf{实验11（MFQ 调度器实现）}：实现了 \texttt{SCHED\_MFQ}（policy=4）调度类，8 级多级反馈队列（L0–L7，时间片 \texttt{10 << level} ticks），修改涉及 8 个内核文件。QEMU 验证通过：I/O-bound 进程保持高优先级先完成，CPU-bound 进程逐级降级后完成。关键结论：自定义调度类的核心不在于代码量（仅 135 行），而在于正确理解调度类接口契约——\texttt{pick\_task} 与 \texttt{pick\_next\_task} 的语义差异决定了队列维护的职责归属，\texttt{put\_prev/set\_next} 的锁操作必须严格匹配以维护 \texttt{preempt\_count} 平衡。
 
 %========================================== 第3章 ==========================================
 \section{进程间通信机制} \label{sec:ch3}
@@ -1087,6 +1166,40 @@ struct sem {
 
 若原子操作全部成功，立即返回用户态。若失败，调用进程被设置为 \texttt{TASK\_INTERRUPTIBLE} 状态，通过 \texttt{schedule\_timeout()} 让出 CPU 进入睡眠，等待后续 V 操作唤醒。当其他进程执行 \texttt{semop()} 中的 V 操作后，\texttt{update\_sem\_otime()} 遍历 \texttt{pending\_alter} 队列，对每个等待进程重新尝试 \texttt{perform\_atomic\_semop()}，成功则调用 \texttt{\_\_wake\_up\_common()} 将其唤醒。这一"完成后重试所有等待者"的机制保证了信号量的公平性——不会因为队列顺序导致某些进程饿死。
 
+\subsubsection{从 Dijkstra PV 到 Linux semop：三层映射}
+
+课本上的 PV 原语是抽象符号，实验中的 \texttt{sem\_p/sem\_v} 是用户态包装函数，内核中的 \texttt{perform\_atomic\_semop} 是真正执行者。以下从理论到实现做三层对照，理清每一层的语义变化：
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{Dijkstra PV 原语 → XSI 信号量集 → 内核实现 三层映射}
+\label{tab:pv_to_xsi}
+\begin{tabular}{p{2.5cm}p{4cm}p{5.5cm}}
+\toprule
+\textbf{层次} & \textbf{P 操作（减量）} & \textbf{V 操作（增量）} \\
+\midrule
+\textbf{理论层}（Dijkstra, 1965）& \texttt{P(S): while(S<=0) wait; S--}——若资源不足则自旋等待，递减必须是原子操作 & \texttt{V(S): S++}——释放资源，若有等待者则唤醒 \\
+\midrule
+\textbf{用户态}（exp4 的 \texttt{sem\_p/sem\_v}）& \texttt{sb.sem\_op=-1; semop(semid, \&sb, 1)}——构造 \texttt{sembuf} 结构体，\texttt{sem\_op} 为负表示 P & \texttt{sb.sem\_op=+1; semop(semid, \&sb, 1)}——\texttt{sem\_op} 为正表示 V \\
+\midrule
+\textbf{内核态}（\texttt{ipc/sem.c}）& \texttt{perform\_atomic\_semop()} 第一遍遍历检查 \texttt{semval >= |sop|}，满足→第二遍执行 \texttt{semval -= |sop|}。不满足→\textbf{回滚已执行的所有操作}→\texttt{schedule\_timeout()} 睡眠 & \texttt{perform\_atomic\_semop()} 无条件 \texttt{semval += sop}→遍历 \texttt{pending\_alter} 队列→对每个等待者重试其操作集→成功则 \texttt{wake\_up\_process()} 唤醒 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{关键细节——内核如何保证操作数组的整体原子性}。\texttt{semop()} 允许用户态一次提交多个操作（\texttt{nsops} 参数），这些操作必须\textbf{全部成功或全部不执行}。内核的 \texttt{perform\_atomic\_semop()} 采用类似银行家算法的"试分配"策略：
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{第一遍——纯检查}：遍历 semop 数组。对每个 V 操作（\texttt{sop > 0}），无条件视为可行。对每个 P 操作（\texttt{sop < 0}），检查 \texttt{semval >= |sop|}。记录每个操作需要修改的量，但不实际修改 \texttt{semval}。
+    \item \textbf{第二遍——执行+回滚}：若第一遍全部通过，遍历数组执行修改：V→\texttt{semval += sop}，P→\texttt{semval -= |sop|}。若任一 P 操作不满足条件，\textbf{回滚所有已执行的修改}（那些 V 操作的 \texttt{semval} 增量要减回去），然后整个操作集标记为"阻塞"，进程进入 \texttt{TASK\_INTERRUPTIBLE} 睡眠。
+    \item \textbf{唤醒后重试}：当其他进程执行 V 操作后，内核遍历 \texttt{sma->pending\_alter} 链表，对每个等待的进程\textbf{从头重新执行完整的检查-执行流程}。这意味着一个进程在睡眠期间，它的"所需资源数"没有锁住任何资源——其他进程可以继续消费信号量，被唤醒的进程重新参与竞争。
+\end{enumerate}
+
+这套机制就是银行家算法在信号量领域的直接投影：银行家的安全序列检查 = \texttt{perform\_atomic\_semop} 的试分配+回滚；进程的 Need = \texttt{sembuf} 数组中的资源需求量；银行家的 Available = 信号量当前值 \texttt{semval}。区别在于信号量不需要预先声明最大需求——\texttt{semop} 数组本身就是"这次要多少"，不满足就睡等下次。
+
+实验 4 的 \texttt{sem\_p/sem\_v} 每次只操作一个信号量（\texttt{nsops=1}），所以原子性保证仅体现在单变量上。实验 8 的死锁检测则直接修改了内核中同一个 \texttt{ipc/sem.c}，在 \texttt{semctl()} 中添加了遍历 \texttt{pending\_alter} 队列的逻辑——与 \texttt{perform\_atomic\_semop} 唤醒等待者时遍历的队列是同一个数据结构。
+
 \subsection{共享内存（Shared Memory）}
 
 共享内存是最高效的 IPC 机制，因为数据传输完全绕过了内核缓冲区（零拷贝）。其实现充分利用了 Linux 虚拟内存管理的惰性分配和缺页处理能力。
@@ -1103,9 +1216,21 @@ struct sem {
 
 \textbf{处理路径}：进程从内核态返回用户态时检查 \texttt{TIF\_SIGPENDING}，调用 \texttt{arch\_do\_signal\_or\_restart()}（\texttt{arch/x86/kernel/signal.c}）→ \texttt{handle\_signal()}，在用户栈上构建信号帧（\texttt{setup\_rt\_frame()}），修改用户态 RIP 指向 handler 入口。handler 返回后通过 \texttt{sigreturn()} 恢复原执行上下文。
 
+\textbf{信号交付本质上是一次"同进程内的用户态 mini context switch"。}这个过程需要在内核态和用户态之间做一次精密的控制转移，其复杂性不亚于调度器中的上下文切换，只是范围局限在单个进程内部。完整时序如下：
+
+\begin{enumerate}[leftmargin=*]
+    \item \textbf{保存现场}：内核在进程的用户栈上构造 \texttt{struct rt\_sigframe}，其中包含被打断时的全部通用寄存器（RAX/RBX/RCX/.../R15）、RIP（被打断的指令地址）、RSP（被打断时的用户栈指针）、RFLAGS，以及信号编号和附加信息（\texttt{siginfo\_t}）。
+    \item \textbf{注入返回地址}：在信号帧中嵌入一个伪造的返回地址——它指向 vDSO 中的 \texttt{\_\_kernel\_rt\_sigreturn} 入口。这不是普通的函数返回地址，而是一个"陷阱"——handler 正常 \texttt{ret} 时就会落入这个地址，触发 \texttt{sigreturn()} 系统调用。
+    \item \textbf{劫持控制流}：修改 \texttt{pt\_regs} 中的 RIP 指向信号 handler 的第一条指令，修改 RSP 指向信号帧上方（handler 使用的新栈区域）。由于这些修改发生在内核态的 \texttt{pt\_regs} 结构上，当进程通过 \texttt{sysretq} 返回用户态时，硬件自动从 \texttt{pt\_regs} 恢复 RIP/RSP——进程"看起来"像是在 handler 入口处开始执行。
+    \item \textbf{handler 执行}：handler 在用户态运行，使用内核为其铺设的新栈区域。它可以访问 \texttt{siginfo\_t} 和 \texttt{ucontext\_t}（通过 handler 参数传入，指向信号帧中的对应区域）。
+    \item \textbf{自动折返}：handler 执行 \texttt{ret} 指令。由于返回地址是 \texttt{\_\_kernel\_rt\_sigreturn}，CPU 跳转到 vDSO 中的 \texttt{syscall} 指令 → 进入内核 \texttt{sigreturn()} 系统调用。内核从用户栈上保存的 \texttt{rt\_sigframe} 中恢复全部通用寄存器、RIP、RSP、RFLAGS → \texttt{sysretq} → 进程回到被打断的原始位置，仿佛什么都没发生过。
+\end{enumerate}
+
+这个过程和调度器上下文切换的对称性值得注意：调度器的 \texttt{\_\_switch\_to\_asm} 在\textbf{内核栈}上保存/恢复寄存器，切换的是\textbf{两个不同进程}的执行流；信号交付在\textbf{用户栈}上保存/恢复寄存器，切换的是\textbf{同一进程的两个用户态上下文}（主执行流和信号 handler）。两者都依赖"在某处保存全量寄存器状态→修改 RIP→未来从保存点恢复"的机制，只是载体不同。
+
 \begin{figure}[htbp]
 \centering
-\includegraphics[width=0.85\textwidth]{fig_ch3_signal_flow.png}
+\includegraphics[height=0.88\textheight]{fig_ch3_signal_flow.png}
 \caption{Linux 信号发送与处理流程}
 \label{fig_ch3_signal_flow}
 \end{figure}
@@ -1180,6 +1305,8 @@ struct zone {
 \texttt{\_\_free\_pages()} 是页释放的主入口。释放路径的精妙之处在于\textbf{伙伴合并}：函数 \texttt{\_\_free\_one\_page()} 将待释放页框加入对应 order 的空闲链表，然后调用 \texttt{\_\_find\_buddy\_pfn()} 计算伙伴页框号。在伙伴系统中，两个页框互为伙伴当且仅当：它们的页框号仅在第 order 位不同（即 \texttt{pfn \textasciicircum (1 << order)}）。通过简单的位运算即可快速定位伙伴，无需遍历链表。
 
 若伙伴同阶且空闲——即满足 \texttt{page\_is\_buddy()} 检查（伙伴不在使用中、同阶、同 zone），则将两个 order-k 伙伴从空闲链表中移除，合并为一个 order-(k+1) 块，然后递归尝试与新的伙伴合并。这一过程持续到无法再合并为止——此时所有可合并的伙伴均已聚合为最大连续块，最大化了大块连续物理内存的可用性。
+
+\textbf{伙伴系统的根本缺陷与 MIGRATE\_TYPES 的补救。}理论上伙伴系统的外部碎片率不超过 33\%，但实践中远不止此。问题出在页面生命周期的异质性：内核通过 \texttt{GFP\_KERNEL} 分配的页面（如 \texttt{kmalloc} 的对象、页表页）在整个系统运行期间散布在各处且无法迁移。当一个不可移动页恰好落在两个可合并的伙伴之间时，合并链被切断——该页两侧的大块永远无法聚合，即使系统有大量空闲内存也凑不出高阶连续块。Linux 通过 \textbf{MIGRATE\_TYPES} 机制缓解此问题：将空闲页面按迁移属性分为 \texttt{MIGRATE\_UNMOVABLE}（内核核心分配，不可移动）、\texttt{MIGRATE\_RECLAIMABLE}（可回收，如 inode/dentry cache）、\texttt{MIGRATE\_MOVABLE}（用户态页面，可通过缺页异常迁移）、\texttt{MIGRATE\_CMA}（连续内存分配器专用）等类型。\texttt{\_\_rmqueue()} 分配时优先在匹配的迁移类型链表中查找，同类页面聚集在一起，碎片只发生在同类型内。但还有一个更深的问题：\texttt{MIGRATE\_UNMOVABLE} 区域会随时间逐渐扩张（内核分配无处不在），侵蚀可移动区域。\texttt{memory compaction}（\texttt{mm/compaction.c}）正是为此存在——它主动迁移 \texttt{MIGRATE\_MOVABLE} 页面到其他位置，为不可移动分配腾出连续空间。实验 10 的 \texttt{page\_stats.ko} 逐页遍历时通过 \texttt{PageBuddy/PageSlab/PageLRU} 等宏分类统计，正是对这几种迁移类型的间接观测。
 
 \figref{fig_ch4_page_alloc} 展示了伙伴系统分配与释放的完整流程。
 
@@ -1295,7 +1422,16 @@ static vm_fault_t do_wp_page(struct vm_fault *vmf) {
 
 \textbf{关键优化}：若 \texttt{folio\_ref\_count == 1}（已无其他使用者，如父进程退出后子进程独占），直接在原页上解除写保护而无需复制，避免了不必要的内存分配和拷贝开销。
 
-\subsection{页面回收与换出}
+\textbf{COW 的工程经济学：为什么 fork+exec 组合几乎免费。}COW 最重要的设计动机不是节省 fork 后的写入——而是让 fork 后立即 exec 的场景不浪费任何物理内存。考虑 shell 执行 \texttt{ls} 的典型流程：
+
+\begin{itemize}[leftmargin=*]
+    \item \texttt{bash}（200MB 常驻内存）调用 \texttt{fork()}。不用 COW 的话，需要立即分配 200MB 物理内存并逐页复制内容。然后 \texttt{exec("ls")} 调用 \texttt{flush\_old\_exec() → exec\_mmap()} 释放整个地址空间——200MB 的分配和复制全部作废。
+    \item 用 COW：\texttt{fork()} 只复制页表。bash 的 200MB 地址空间按 4KB 分页，共约 51,200 个 PTE，每个 PTE 8 字节，页表复制开销约 400KB。父子进程的页表项均标记为只读（\texttt{PTE\_RDONLY | PTE\_SOFT\_DIRTY}），但物理页框不做任何复制——父子共享全部 200MB 物理页。
+    \item \texttt{exec("ls")} 调用 \texttt{exec\_mmap() → mmput(old\_mm)}，旧 mm\_struct 的引用计数递减。页表被释放（400KB 回收），但物理页框因为 bash 父进程仍持有引用而不释放。子进程从未写入过任何共享页——\textbf{零 COW 缺页发生}。
+    \item 总开销：400KB 的页表复制 + 释放。与父进程内存大小无关。
+\end{itemize}
+
+这个设计使得 Unix 的"fork+exec 创建新进程"模式在工程上可行——否则每次敲命令都要复制整个 shell 的内存，200MB 的 bash 会让系统寸步难行。实验 10 的 \texttt{mem\_cow.c} 通过 \texttt{/proc/<pid>/smaps} 观察 PSS（Proportional Set Size）值验证了此机制：fork 后父子 PSS 各为原值的一半（共享页按引用计数均分），子进程写入后才各自增长为独立物理页的完整值。
 
 当系统内存压力增大时，\texttt{kswapd} 守护线程被唤醒执行页面回收（\texttt{mm/vmscan.c}）。回收策略：遍历 LRU 链表（Active/Inactive × Anonymous/File 四个链表），优先回收 Inactive 端页面。匿名页通过 \texttt{add\_to\_swap()} 分配 swap 槽位写入 swap 设备，PTE 替换为 swap 条目。文件页若干净可直接丢弃（可从磁盘重读），若脏页先调用 \texttt{writepage()} 写回。
 
@@ -1436,7 +1572,15 @@ static ssize_t ext2_file_read_iter(struct kiocb *iocb, struct iov_iter *to) {
 }
 \end{lstlisting}
 
-\texttt{generic\_file\_read\_iter()}（\texttt{mm/filemap.c}）实现缓冲 I/O 的标准数据流，是理解文件 I/O 与内存管理协同工作的关键：首先在 page cache 中查找文件偏移对应的 page（\texttt{filemap\_get\_folio()}）——若命中（大多数顺序读场景），直接通过 \texttt{copy\_page\_to\_iter()} 将内核页面的数据复制到用户空间 \texttt{iov\_iter}；若未命中（首次访问或缓存被回收），分配新 page 并调用 \texttt{filemap\_read\_folio()} → \texttt{ext2\_read\_folio()} 触发磁盘 I/O，将文件数据块读入 page cache，然后复制给用户。这一"page cache → copy to user"模式是 Linux 文件 I/O 的基石——内核在 page cache 中维护文件数据的统一缓存，既服务于 \texttt{read()} 系统调用也服务于 \texttt{mmap()} 的文件映射缺页处理，避免了两套独立缓存的冗余和一致性问题。
+\texttt{generic\_file\_read\_iter()}（\texttt{mm/filemap.c}）实现缓冲 I/O 的标准数据流，是理解文件 I/O 与内存管理协同工作的关键：首先在 page cache 中查找文件偏移对应的 page（\texttt{filemap\_get\_folio()}）——若命中（大多数顺序读场景），直接通过 \texttt{copy\_page\_to\_iter()} 将内核页面的数据复制到用户空间 \texttt{iov\_iter}；若未命中（首次访问或缓存被回收），分配新 page 并调用 \texttt{filemap\_read\_folio()} → \texttt{ext2\_read\_folio()} 触发磁盘 I/O，将文件数据块读入 page cache，然后复制给用户。
+
+\textbf{统一 Page Cache——Linux 消除双重缓存的关键设计。}经典 Unix 有一个著名的架构问题：文件数据在"buffer cache"（块设备缓存，以磁盘块为单位）和"page cache"（文件页缓存，以页为单位）中各存一份。数据从磁盘读入 buffer cache，再复制到 page cache，再复制到用户空间——两次内存拷贝、两份内存占用、一致性维护复杂。Linux 通过 \texttt{struct address\_space} 彻底解决了这一问题。
+
+每个文件的 \texttt{inode} 拥有一个 \texttt{address\_space}（\texttt{i\_mapping}），其中的 \texttt{i\_pages}（xarray 基数树）以文件偏移量为键，映射到 page cache 中的物理页面。关键设计在于：\texttt{ext2\_file\_read\_iter()}（文件 read 路径）调用 \texttt{generic\_file\_read\_iter() → filemap\_read()} 在这个 xarray 中查找页面；\texttt{ext2\_filemap\_fault()}（文件 \texttt{mmap} 缺页路径）也在\textbf{同一个} xarray 中查找。如果 \texttt{read()} 先访问了文件偏移 0–4095，该页面进入 \texttt{address\_space}；随后 \texttt{mmap} 映射的同一文件同一偏移被访问，缺页处理在 xarray 中命中——直接映射该物理页到进程页表，无需再次读磁盘。反之亦然。
+
+这意味着：通过 \texttt{read()} 和 \texttt{mmap()} 访问同一文件的两个进程，在物理内存中共享的是\textbf{完全相同的页面}，而不是两份独立的缓存。\texttt{open() → read() → close()} 和 \texttt{open() → mmap() → 内存访问 → munmap()} 在 page cache 层面完全统一，只是用户态接口不同。这一设计是 Linux 文件 I/O 架构的核心美学——它消除了 Unix 传承数十年的双重缓存问题，同时保证了一致性（不存在 buffer cache 已更新但 page cache 未更新的窗口）。
+
+实验 9（ext2m 加密文件系统）的设计决策正是基于对此数据流的精确理解：XOR 加解密操作插入在 \texttt{read\_iter/write\_iter} 层而非 \texttt{read\_folio/writepages} 层，确保 page cache 始终存储密文，\texttt{read()} 和 \texttt{mmap()} 两个路径共享同样的加密语义，不会因为页缓存的一致性而产生双重加密或遗漏加密的问题。
 
 \subsection{实验验证}
 
@@ -1473,7 +1617,35 @@ static ssize_t ext2_file_read_iter(struct kiocb *iocb, struct iov_iter *to) {
 
 \textbf{文件系统方面}：分析了 VFS 四对象模型（super\_block/inode/dentry/file）、\texttt{link\_path\_walk()} 路径名解析（dcache 快速路径 + \texttt{i\_op->lookup()} 慢速路径）、ext2 磁盘布局（块组/super block/inode table/\texttt{i\_block[15]} 间接块寻址）以及 \texttt{read\_iter/write\_iter} 的 page cache 数据流。
 
-每章末尾附带的课程实验验证（共 11 个）从实践层面印证了源码分析的理论认知，为深入理解 Linux 内核的运行机理提供了坚实的工程基础。
+\subsection{跨子系统设计模式}
+
+分别阅读六个子系统后可以识别出一些反复出现的设计模式。这些模式不是某个文件或函数的局部选择，而是 Linux 内核在演化中收敛形成的"设计语言"，理解它们有助于在阅读任何内核代码时更快地建立心智模型：
+
+\begin{table}[htbp]
+\centering
+\footnotesize
+\caption{Linux 内核跨子系统设计模式}
+\label{tab:design_patterns}
+\begin{tabular}{p{2cm}p{3cm}p{3cm}p{3cm}p{2.5cm}}
+\toprule
+\textbf{模式} & \textbf{调度器} & \textbf{内存管理} & \textbf{文件系统/VFS} & \textbf{IPC} \\
+\midrule
+\textbf{惰性求值} & 新进程不分配时间片直到被 \texttt{pick\_task} 选中；MFQ 的 \texttt{mfq\_entity\_init} 在首次 \texttt{enqueue} 时才调用 & COW 延迟物理页复制；缺页异常按需分配页框；VMA 惰性映射（\texttt{mmap} 只建 VMA 不分配页） & dentry 按需创建（\texttt{lookup} 慢路径）；inode 延迟从磁盘读取 & 共享内存惰性附加（\texttt{shmat} 只建 VMA，首次访问才在 \texttt{shmem\_fault} 中映射物理页）\\
+\midrule
+\textbf{快慢路径分离} & \texttt{pick\_next\_task} 快速路径：全 CFS 任务时直接走 \texttt{fair}；慢速路径：\texttt{for\_each\_active\_class} 遍历全部调度类 & \texttt{get\_page\_from\_freelist} 快速路径：伙伴系统直接分配；慢速路径：\texttt{\_\_alloc\_pages\_slowpath} → 压缩→回收→OOM & \texttt{walk\_component} 快速路径：dcache 哈希命中 O(1)；慢速路径：\texttt{i\_op->lookup()} 磁盘 I/O & futex 快速路径：用户态 CAS 无竞争直接返回；慢速路径：\texttt{futex(FUTEX\_WAIT)} 进内核睡眠 \\
+\midrule
+\textbf{RCU + 引用计数} & \texttt{rq->curr} 用 RCU 保护读取，\texttt{task\_struct} 的 \texttt{usage} 引用计数控制释放 & \texttt{folio\_ref\_count} 保护页面生命周期；\texttt{mm\_struct} 的 \texttt{mm\_users/mm\_count} 双重计数 & dentry 的 \texttt{d\_lockref}（混合 spinlock + 引用计数）；inode 的 \texttt{i\_count} & \texttt{sem\_array→sem\_perm.refcount}；共享内存 \texttt{shmid\_kernel} 的引用计数 \\
+\midrule
+\textbf{per-CPU 隔离} & \texttt{struct rq} per-CPU；MFQ 的 \texttt{DEFINE\_PER\_CPU(mfq\_rq)}；调度类无需全局锁 & per-CPU page cache（\texttt{struct per\_cpu\_pages}）；slub 的 per-CPU  slab 缓存 & — & — \\
+\midrule
+\textbf{分裂返回} & \texttt{schedule()} 在 \texttt{context\_switch} 后返回时可能在另一个进程中 & \texttt{fork()} 父子同时返回但返回值不同（子=0，父=pid） & — & \texttt{semop()} 阻塞睡眠后返回：内核在 \texttt{perform\_atomic\_semop} 失败后 \texttt{schedule\_timeout}，进程被 V 操作唤醒后"看起来"从 \texttt{semop()} 调用处继续 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+这五种模式贯穿了从进程管理到文件系统的全部六个子系统。"惰性求值"最小化初始开销（fork 廉价 + COW 减拷贝 + dcache 减磁盘 I/O），"快慢路径分离"保证常见情况零开销（全 CFS 不走遍历 + dcache 命中不走磁盘 + futex 无竞争不陷入内核），"RCU + 引用计数"在性能和安全性之间取得平衡（读端免锁 + 生命周期精确控制），"per-CPU 隔离"消除全局锁竞争（每个 CPU 独立运行队列和页缓存），"分裂返回"将异步语义包装为同步调用接口（fork 一个调用两个返回 + schedule 睡眠透明）。
+
+每章末尾附带的课程实验验证（共 11 个）从实践层面印证了源码分析的理论认知。这些实验不仅覆盖了内核各子系统的基本操作，更关键的是——实验 4 的 XSI 信号量、实验 8 的内核死锁检测、实验 11 的 MFQ 调度器实现——直接触及了内核源码的修改和扩展，将"阅读"上升到了"理解和操作"的层次。
 
 %========================================== 参考文献 ==========================================
 \begin{thebibliography}{99}
